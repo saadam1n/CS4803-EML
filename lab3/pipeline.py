@@ -55,7 +55,14 @@ def make_split_spec_custom(model: BertModel, pattern: str, world_size: int):
     Return a dict[str, SplitPoint].
     """
     # >>> YOUR CODE HERE <<<
-    raise NotImplementedError("Implement custom unbalanced partitioning (e.g., 3-1-2-2).")
+
+    cur_split_pos = 0
+    return {
+        f"encoder.layer.{(cur_split_pos := cur_split_pos + size)}": SplitPoint.BEGINNING
+        for size in pattern[:-1]
+    }
+
+    #raise NotImplementedError("Implement custom unbalanced partitioning (e.g., 3-1-2-2).")
 
 
 # ---------------------------
@@ -72,7 +79,33 @@ def wrap_stage_forward_for_timing(module: torch.nn.Module, device: torch.device)
     #   start = torch.cuda.Event(enable_timing=True); end = torch.cuda.Event(enable_timing=True)
     #   with torch.cuda.device(device): start.record(); out = orig(*args, **kw); end.record()
     #   torch.cuda.synchronize(device); module._acc_ms += start.elapsed_time(end)
-    pass
+    # Initialize the accumulator attribute if it doesn't exist
+    if not hasattr(module, '_acc_ms'):
+        module._acc_ms = 0.0
+    
+    # Store the original forward method
+    orig_forward = module.forward
+    
+    def timed_forward(*args, **kwargs):
+        # Create CUDA events for timing
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        
+        # Record timing around the forward pass
+        with torch.cuda.device(device):
+            start.record()
+            output = orig_forward(*args, **kwargs)
+            end.record()
+        
+        # Synchronize and accumulate elapsed time
+        torch.cuda.synchronize(device)
+        elapsed_ms = start.elapsed_time(end)
+        module._acc_ms += elapsed_ms
+        
+        return output
+    
+    # Replace the forward method with the timed version
+    module.forward = timed_forward
 
 
 # ---------------------------
@@ -105,14 +138,53 @@ def warmup_and_measure(schedule: ScheduleGPipe,
       - Use time.time() wall clock for elapsed_seconds
     """
     # >>> YOUR CODE HERE <<<
-    raise NotImplementedError("Implement warmup+measure timing and peak memory collection.")
+    rank = dist.get_rank()
+
+    torch.cuda.reset_peak_memory_stats(rank)
+
+    if rank == 0:
+        full_inputs = generate_inputs_for_model(BertModel, model, "BertModel", global_batch_size, device)    
+
+    num_warmup_iters = steps_warmup
+    num_timing_iters = steps_measure
+
+    for i in range(num_warmup_iters + num_timing_iters):
+        if i < num_warmup_iters:
+            if rank == 0:
+                print(f"Completing warmup iteration {i+1}/{num_warmup_iters}")
+        elif i == num_warmup_iters:
+            if rank == 0:
+                print("Warmup completed, starting data collection...")
+
+            tic = time.time()
+
+        if rank == 0:
+            schedule.step(**full_inputs)
+        else:
+            _ = schedule.step()
+        dist.barrier()
+    
+    torch.cuda.synchronize(device)
+    toc = time.time()
+
+    if rank == 0:
+        print("Data collection completed")
+
+    throughput = num_timing_iters / (toc - tic)
+    peak_bytes = torch.cuda.max_memory_allocated(rank)
+
+
+
+    return throughput, peak_bytes
+
+    #raise NotImplementedError("Implement warmup+measure timing and peak memory collection.")
 
 
 # ---------------------------
 # One run for a given seed
 # ---------------------------
 
-def run_one_seed(args, pipe_ir, model):
+def run_one_seed(args, pipe_ir, model, seed):
     """
     TODO: If you want per-stage forward timing (Step 4), wrap your stage module first.
 
@@ -129,8 +201,8 @@ def run_one_seed(args, pipe_ir, model):
     schedule = ScheduleGPipe(stage, args.chunks)
 
     # OPTIONAL: per-stage forward timing
-    # stage_module = pipe_ir.get_stage_module(rank)
-    # wrap_stage_forward_for_timing(stage_module, args.device)
+    stage_module = pipe_ir.get_stage_module(rank)
+    wrap_stage_forward_for_timing(stage_module, args.device)
 
     # Warmup + measure
     thr, peaks = warmup_and_measure(
@@ -144,20 +216,31 @@ def run_one_seed(args, pipe_ir, model):
     )
 
     # OPTIONAL: stage timing average per step if you wrapped forward
-    # stage_ms = getattr(stage_module, "_acc_ms", None)
-    # if stage_ms is not None:
-    #     stage_ms = float(stage_ms) / args.steps_measure
+    stage_ms = getattr(stage_module, "_acc_ms", None)
+    if stage_ms is not None:
+        stage_ms = float(stage_ms) / args.steps_measure
 
     # Gather per-rank peaks to rank 0
     # (Hint: use dist.all_gather_object to collect Python ints from all ranks)
     # >>> YOUR CODE HERE <<<  (replace the fake single-rank list below)
-    peaks_all = [peaks]  # placeholder: WRONG; implement all_gather_object to collect from all ranks
+    
+    peaks_all = [None] * dist.get_world_size() 
+    torch.cuda.set_device(rank) 
+    dist.all_gather_object(peaks_all, peaks)
+
+    stage_all = [None] * dist.get_world_size() 
+    dist.all_gather_object(stage_all, stage_ms)
 
     out = {
-        "seed": args.seed,
+        "world_size": dist.get_world_size(),
+        "global_batch_size": args.global_batch_size,
+        "chunks": args.chunks,
+        "microbatch_size": args.global_batch_size // args.chunks,
+        "partition": args.partition,
+        "seed": seed,
         "throughput_samples_per_s": float(thr),
         "mem_peak_per_rank_bytes": peaks_all,
-        # "stage_forward_time_ms_per_rank": ...  # optional
+        "stage_forward_time_ms_per_rank": stage_all
     }
     return out
 
@@ -179,6 +262,7 @@ def run(args):
     model.eval()
 
     if rank == 0:
+        print(model)
         print(model.config)
         print(f"Total params ≈ {get_number_of_params(model) // 10 ** 6}M")
 
@@ -191,7 +275,9 @@ def run(args):
     if args.partition == "even":
         split_spec = make_split_spec_even(model, world_size)
     else:
-        split_spec = make_split_spec_custom(model, args.partition, world_size)
+        parsed_part = [int(x) for x in args.partition.split(',')]
+
+        split_spec = make_split_spec_custom(model, parsed_part, world_size)
 
     if rank == 0:
         print("Split points:", list(split_spec.keys()))
@@ -230,7 +316,37 @@ def run(args):
     #   - If args.out is set, write a dict containing spec + per_seed + agg results.
     #
     # >>> YOUR CODE HERE <<<
-    raise NotImplementedError("Implement multi-seed loop, aggregation, and optional JSON saving.")
+
+    parsed_seeds = [int(x) for x in args.seeds.split(',')]
+
+    if rank == 0:
+        print(f"Utilizing seeds {parsed_seeds}")
+
+    perf_results = []
+    for seed in parsed_seeds:
+        if rank == 0:
+            print(f"Using seed {seed}")
+
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+        cur_results = run_one_seed(args, pipe_ir, model, seed)
+
+        perf_results.append(cur_results)
+
+    print(f"[Rank {rank}] Results: {perf_results}")
+
+    # TODO: save to json
+    if rank == 0 and args.out is not None:
+        with open(args.out, 'w') as f:
+            json.dump(perf_results, f, indent=2)
+            
+        print(f"[Rank {rank}] Saved results to {args.out}")
+    elif rank == 0:
+        print(f"[Rank {rank}] No output directory! Please note this data will be unuseable in analysis.")
+
+
+    #raise NotImplementedError("Implement multi-seed loop, aggregation, and optional JSON saving.")
 
 
 def main():
