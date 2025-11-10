@@ -152,3 +152,115 @@ Please see the next deliverable for evidence.
 
 - A slow stage in the pipeline end up leaving faster stages that come afterwards waiting on inputs to arrive.
 - This leads to underutilization and worse throughput.
+
+## Task 4
+
+Seeds used for both: 1, 2, 3
+
+DDP results for global batch size = 64:
+
+```
+Aggregate: {
+  "throughput_mean": 111.16570593892513,
+  "throughput_std": 0.12228515652003448,
+  "time_per_step_mean": 0.5757178155581156,
+  "time_per_step_std": 0.0006328498033082033,
+  "mem_peak_per_rank_mean_bytes": [
+    38312673450.666664,
+    38312673450.666664,
+    38312673450.666664,
+    38312673450.666664
+  ],
+  "mem_peak_per_rank_std_bytes": [
+    247151.73339648842,
+    247151.73339648842,
+    247151.73339648842,
+    247151.73339648842
+  ]
+}
+```
+
+FSDP results for global batch size = 64:
+
+```
+Aggregate: {
+  "throughput_mean": 102.94562546599454,
+  "throughput_std": 11.785863109064842,
+  "time_per_step_mean": 0.6306810474395752,
+  "time_per_step_std": 0.07855699593537264,
+  "mem_peak_per_rank_mean_bytes": [
+    37545608704.0,
+    37545600512.0,
+    37545600512.0,
+    37546165760.0
+  ],
+  "mem_peak_per_rank_std_bytes": [
+    178843529.87828666,
+    178836841.1382957,
+    178836841.1382957,
+    178811758.94974294
+  ]
+}
+```
+
+At first, this data appeared unexpected (I was thinking we'd see a much bigger memory usage difference between FSDP and DDP). I reran teh tests with global batch size = 16
+
+DDP results for global batch size = 16:
+
+```
+Aggregate: {
+  "throughput_mean": 103.07518594170095,
+  "throughput_std": 0.31990644738058055,
+  "time_per_step_mean": 0.15522798935572307,
+  "time_per_step_std": 0.00048097297912959736,
+  "mem_peak_per_rank_mean_bytes": [
+    10945447594.666666,
+    10945360213.333334,
+    10945447594.666666,
+    10944776362.666666
+  ],
+  "mem_peak_per_rank_std_bytes": [
+    975609.2788479526,
+    1006087.1943197678,
+    975609.2788479526,
+    265663.4852105615
+  ]
+}
+```
+
+FSDP results for global batch size = 16:
+
+```
+Aggregate: {
+  "throughput_mean": 102.32684753229941,
+  "throughput_std": 0.2678426755018219,
+  "time_per_step_mean": 0.15636277198791504,
+  "time_per_step_std": 0.0004089306595197579,
+  "mem_peak_per_rank_mean_bytes": [
+    10176927232.0,
+    10176919040.0,
+    10176919040.0,
+    10176919040.0
+  ],
+  "mem_peak_per_rank_std_bytes": [
+    178843529.87828666,
+    178836841.1382957,
+    178836841.1382957,
+    178836841.1382957
+  ]
+}
+```
+Anaylsis:
+- In both cases, FSDP uses about 700 MB of memory less. 
+- This is most likely the savings from full sharding the model.
+- However in both DDP and FSDP we are using gigabytes of memory. 
+    - This is most likely due to the activation tensors kept during the forwards pass and saved for the backwards pass.
+    - Using one-fourth the batch size led to nearly one-fourth the memory. 
+    - In both DDP and FSDP, each GPU stores the non-sharded batch, which explains why we don't see a one-fourth memory saving.
+- According to the data, FSDP has slightly lower throughput
+    - This is most likely due to the additional communication involved
+- I would recommend DDP for this model as it is only 109 MB parameters and DDP is less complex and faster (no inter-GPU communication)
+    - Furthermore, the main source of memory usage is activation tensors
+    - Would recommend gradient accumulation
+
+

@@ -112,6 +112,10 @@ def generate_inputs_for_model(
     num_choices = 3
     num_visual_features = 42
     seq_length = get_sequence_length(model_cls, model_name)
+
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        model = model.module
+
     vocab_size = model.config.vocab_size
 
     if model_name.startswith("Wav2Vec2"):

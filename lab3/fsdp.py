@@ -71,6 +71,8 @@ def reset_peak(device):
 
 
 def ddp_model(model, device):
+    print("USING DDP MODEL\n" * 100)
+
     model.to(device)
     return DDP(model, device_ids=[device.index], output_device=device.index)
 
@@ -79,6 +81,7 @@ def fsdp_full_shard_model(model, device, use_mixed_precision=True):
     """
     FSDP with FULL_SHARD (parameters, gradients, optimizer states fully sharded).
     """
+    print("USING FSDP MODEL\n" * 100)
     mp = MixedPrecision(
         param_dtype=torch.float16 if use_mixed_precision else None,
         reduce_dtype=torch.float16 if use_mixed_precision else None,
@@ -167,7 +170,9 @@ def warmup_and_measure(args, model, device, global_batch_size, steps_warmup, ste
       - peak_bytes_all_ranks: List[int] gathered across ranks
     """
     rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    world_size = dist.get_world_size() 
+
+    print(f"Beginning warm up and measure")
 
     # Build a full-batch input
     inputs = generate_inputs_for_model(BertForMaskedLM, model, "BertForMaskedLM",
@@ -178,7 +183,9 @@ def warmup_and_measure(args, model, device, global_batch_size, steps_warmup, ste
 
     # Warmup (not timed)
     reset_peak(device)
-    for _ in range(steps_warmup):
+    for i in range(steps_warmup):
+        print(f"Warmup stage {i+1}/{steps_warmup}")
+
         if do_backward:
             _ = run_train_step(model, inputs, optimizer, scaler, autocast_enabled=args.amp)
         else:
@@ -186,6 +193,7 @@ def warmup_and_measure(args, model, device, global_batch_size, steps_warmup, ste
     dist.barrier(); torch.cuda.synchronize(device)
 
     # Measure
+    print("Beginning actual timing")
     reset_peak(device)
     t0 = time.time()
     for _ in range(steps_measure):
@@ -202,6 +210,8 @@ def warmup_and_measure(args, model, device, global_batch_size, steps_warmup, ste
 
     # Gather peak memory from all ranks
     peak_all = [None for _ in range(world_size)]
+    print(f"[Rank {rank}] Gathering")
+    torch.cuda.set_device(rank) 
     dist.all_gather_object(peak_all, peak_local)
 
     return float(throughput), float(time_per_step), peak_all
